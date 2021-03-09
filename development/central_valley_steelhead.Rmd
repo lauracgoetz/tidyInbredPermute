@@ -1,0 +1,571 @@
+---
+title: "CVSH Inbreeding Analysis"
+output: html_notebook
+---
+
+Follow Eric's steps for using tidyInbredPermute to check out inbreeding in CVSH data
+
+Changed to follow Anne's stuff too
+
+# Set up
+
+First need to clone package from github (https://github.com/eriqande/tidyInbredPermute.git) and build it in an R session.
+```{r}
+library(tidyverse)
+library(tidyInbredPermute)
+library(lubridate)
+```
+
+## Files needed 
+
+Going to use: 
+- ID_Date_Sex: file with NMFS_DNA_ID, COLLECTION_DATE, and SEX AND POPNAME
+- CVSH metadata file ^ 
+- 
+```{r}
+# metadata
+metadata <- read_rds("../Metadata/cvsh_meta.rds")
+# wide genotypes
+wide_genos <- read_csv("../Metadata/cvsh_wide_genos.csv")
+# trios data
+trios <-read_rds("../Data/final_pedigree.rds")
+# cluster data
+cluster <- read_rds("../Data/clusters.rds")
+
+# dataset with only matches between snppit runs
+cvsh_filt <-read_rds("../Data/final_dataset.rds")
+```
+
+Format wide_genos (genotype) file
+
+```{r}
+wides <- wide_genos %>% 
+  rename("indiv"="NMFS_DNA_ID")
+# 23670 individuals
+
+```
+
+Format trios file
+```{r}
+trios_use <- filter(trios, use_sex == "YES")
+# 13635 trios remaining
+
+# separate rows for parent sg then remove any rows where sgs don't match
+trios_use <- trios_use %>% 
+  separate_rows(ma_sg, sep = ",") %>% 
+  separate_rows(pa_sg, sep = ",") 
+trios_use <- trios_use %>% 
+  filter(ma_sg == pa_sg) 
+# 12833 trios remaining
+
+# make list of IDs in pedigree trios
+kid_ids <- trios_use %>% 
+  select(kid) %>% 
+  rename("indiv"="kid")
+ma_ids <- trios_use %>% 
+  select(ma) %>% 
+  rename("indiv"="ma")
+pa_ids <- trios_use %>% 
+  select(pa) %>% 
+  rename("indiv"="pa")
+
+trios_ids <- rbind(kid_ids, ma_ids, pa_ids)
+# 38499 ids oho lol
+
+# also remove duplicated ids:
+trios_ids <- distinct(trios_ids)
+# 16126 id ok 
+```
+
+Format metadata file to cvids file , make genos file
+```{r}
+cvids <- metadata %>% 
+  select(indiv, spawner_group, sex, year, hatchery)
+# 23670 spawners
+
+# filter cvids by if included in trios of interest - trios_ids
+# this leaves only individuals without sex conflicts
+cvids <- semi_join(cvids, trios_ids)
+# 16124 spawners left
+
+genos_and_meta <- left_join(cvids, wides, by = "indiv")
+# 16124 spawners 
+```
+
+# Computing pairwise Rxy 
+
+Compute by spawn date
+
+```{r}
+# use genos_and_meta file                                                      
+# write to a file
+genos_and_meta %>%
+  select(indiv, Omy_AldA:`SH127510-920_1`) %>%
+  write.table(sep = "\t", file = "temp.tsv", row.names = FALSE, col.names = FALSE, quote = FALSE)
+# then read it in
+cvdat <- related::readgenotypedata("temp.tsv")
+```
+
+Now, we can run related on any subset of those (but keeping the same allele frequencies)
+by just swapping out the gdata portion.
+```{r}
+# first 10 indivs
+rel1 <- related::coancestry(cvdat$gdata[1:10,], quellergt=1, allele.freqs = cvdat$freqs)$relatedness %>%
+  as_tibble() %>%
+  select(ind1.id, ind2.id, quellergt)
+# first 5 indivs
+rel2 <- related::coancestry(cvdat$gdata[1:5,], quellergt=1, allele.freqs = cvdat$freqs)$relatedness %>%
+  as_tibble() %>%
+  select(ind1.id, ind2.id, quellergt)
+# note that you get the same result for the shared individuals.
+```
+
+## OK, so, if I wanted to just do the individuals spawned in 2013, for example, it would look like this:
+```{r, eval=FALSE}
+ids2013 <- genos_and_meta %>%
+  select(indiv, year) %>%
+  filter(year == 2013) %>%
+  pull(indiv)
+geno2013 <- cvdat$gdata %>%
+  filter(V1 %in% ids2013)
+rxy2013 <- related::coancestry(geno2013, quellergt=1, allele.freqs = cvdat$freqs)$relatedness %>%
+  as_tibble() %>%
+  select(ind1.id, ind2.id, quellergt)
+```
+
+#how about 2019, is my genos_and_meta file working correctly?
+```{r, eval=FALSE}
+ids2019 <- genos_and_meta %>%
+  select(indiv, year) %>%
+  filter(year == 2019) %>%
+  pull(indiv)
+geno2019 <- cvdat$gdata %>%
+  filter(V1 %in% ids2019)
+rxy2019 <- related::coancestry(geno2019, quellergt=1, allele.freqs = cvdat$freqs)$relatedness %>%
+  as_tibble() %>%
+  select(ind1.id, ind2.id, quellergt)
+```
+
+Running related on all your data is impossible - too much on the computer to run. Running on trios file and compute rxys between pairs on daily basis. 
+
+
+## Rxys Interested In
+
+So, here is a function that takes a data frame called data and returns
+all possible rxys between the IDS in that data frame.
+```{r}
+get_rxys <- function(data) {
+  d <- semi_join(cvdat$gdata, data, by = c("V1" = "indiv"))
+  rxy1 <- related::coancestry(d, quellergt=1, allele.freqs = cvdat$freqs)$relatedness %>%
+    as_tibble() %>%
+    select(ind1.id, ind2.id, quellergt) %>%
+    rename(ind1 = ind1.id, ind2 = ind2.id)
+  rxy2 <- rxy1[, c(2,1,3)] %>%
+    set_names(c("ind1", "ind2", "quellergt"))
+  
+  bind_rows(rxy1, rxy2)
+}
+```
+
+
+Filter trios by hatchery into four different files 
+```{r}
+trios_to_use_CH <- trios_use %>% 
+  filter(PopName == "Coleman_Hatchery") %>% 
+  mutate(spawn_date = mdy(pa_sg))
+trios_to_use_FRH <- trios_use %>% 
+  filter(PopName == "Feather_River_Hatchery") %>% 
+  mutate(spawn_date = mdy(pa_sg))
+trios_to_use_MRH <- trios_use %>% 
+  filter(PopName == "Mokelumne_River_Hatchery") %>% 
+  mutate(spawn_date = mdy(pa_sg))
+trios_to_use_NH <- trios_use %>% 
+  filter(PopName == "Nimbus_Hatchery") %>% 
+  mutate(spawn_date = mdy(pa_sg))
+```
+
+Filter cvids by hatchery into four different files
+```{r}
+day_fish_CH <- cvids %>%
+  mutate(spawn_date = mdy(spawner_group)) %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  semi_join(trios_to_use_CH, by = "spawn_date") %>%
+  arrange(spawn_date) %>%
+  mutate(num_fish = map_int(data, nrow))
+day_fish_FRH <- cvids %>%
+  mutate(spawn_date = mdy(spawner_group)) %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  semi_join(trios_to_use_FRH, by = "spawn_date") %>%
+  arrange(spawn_date) %>%
+  mutate(num_fish = map_int(data, nrow))
+day_fish_MRH <- cvids %>%
+  mutate(spawn_date = mdy(spawner_group)) %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  semi_join(trios_to_use_MRH, by = "spawn_date") %>%
+  arrange(spawn_date) %>%
+  mutate(num_fish = map_int(data, nrow))
+day_fish_NH <- cvids %>%
+  mutate(spawn_date = mdy(spawner_group)) %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  semi_join(trios_to_use_NH, by = "spawn_date") %>%
+  arrange(spawn_date) %>%
+  mutate(num_fish = map_int(data, nrow))
+```
+
+
+Compute rxys
+```{r}
+rxys_in_days_CH <- day_fish_CH %>%
+  mutate(pairs = map(data, get_rxys))
+rxys_in_days_FRH <- day_fish_FRH %>%
+  mutate(pairs = map(data, get_rxys))
+rxys_in_days_MRH <- day_fish_MRH %>%
+  mutate(pairs = map(data, get_rxys))
+rxys_in_days_NH <- day_fish_NH %>%
+  mutate(pairs = map(data, get_rxys))
+```
+
+
+
+Add into there a list column that has all the
+trios that were assigned to particular spawn dates:
+```{r}
+nested_trios_CH <- trios_to_use_CH %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  arrange(spawn_date) %>%
+  mutate(n_trios = map_int(data, nrow),
+         n_dads = map_int(data, function(x) n_distinct(x$pa)),
+         n_moms = map_int(data, function(x) n_distinct(x$ma))) %>%
+  rename(trios = data)
+nested_trios_FRH <- trios_to_use_FRH %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  arrange(spawn_date) %>%
+  mutate(n_trios = map_int(data, nrow),
+         n_dads = map_int(data, function(x) n_distinct(x$pa)),
+         n_moms = map_int(data, function(x) n_distinct(x$ma))) %>%
+  rename(trios = data)
+nested_trios_MRH <- trios_to_use_MRH %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  arrange(spawn_date) %>%
+  mutate(n_trios = map_int(data, nrow),
+         n_dads = map_int(data, function(x) n_distinct(x$pa)),
+         n_moms = map_int(data, function(x) n_distinct(x$ma))) %>%
+  rename(trios = data)
+nested_trios_NH <- trios_to_use_NH %>%
+  group_by(spawn_date) %>%
+  nest() %>%
+  arrange(spawn_date) %>%
+  mutate(n_trios = map_int(data, nrow),
+         n_dads = map_int(data, function(x) n_distinct(x$pa)),
+         n_moms = map_int(data, function(x) n_distinct(x$ma))) %>%
+  rename(trios = data)
+```
+
+```{r}
+interm1_CH <- rxys_in_days_CH %>%
+  rename(spawners = data,
+         rxy_pairs = pairs) %>%
+  left_join(nested_trios_CH, by = "spawn_date")
+interm1_FRH <- rxys_in_days_FRH %>%
+  rename(spawners = data,
+         rxy_pairs = pairs) %>%
+  left_join(nested_trios_FRH, by = "spawn_date")
+interm1_MRH <- rxys_in_days_MRH %>%
+  rename(spawners = data,
+         rxy_pairs = pairs) %>%
+  left_join(nested_trios_MRH, by = "spawn_date")
+interm1_NH <- rxys_in_days_NH %>%
+  rename(spawners = data,
+         rxy_pairs = pairs) %>%
+  left_join(nested_trios_NH, by = "spawn_date")
+```
+
+OK, `interm1` basically has everything that we need to operate on each spawn
+day and do what we need to do.
+
+Now mirror the distribution of observed family sizes and things, too.  Basically
+randomly map spawning males to observed fathers in trios, and spawning females
+to observed mothers in trios, and compute the distribution of rxy values that way.
+
+That will preserve the (extra) variance that is due to the fact that we don't have a random
+number of individuals from each pair, etc. So, I just need to figure out how to
+do that efficiently.  
+
+## Doing permutations and extracting Rxy
+
+Goal: get the observed rxy values for all of the trio pairs found.  Let's make a function
+for that first.
+
+Here is a function for extracting the actual Rxy:
+```{r}
+#' @param tdf trio data frame.  An element of the trios list column
+#' @param rxyp rxy_pairs data frame.  An element of the rxy_pairs list column
+extract_observed_rxy <- function(tdf, rxyp) {
+  left_join(tdf, rxyp, by = c("pa" = "ind1", "ma" = "ind2"))
+}
+```
+
+And how about a function for extracting Rxys when random males or females are
+assigned to those Pa_IDs and Ma_IDs.  I have a way to do this efficiently, I do
+believe.  We do it all with a few joins in series.
+```{r}
+#' @param tdf trio data frame.  An element of the trios list column
+#' @param rxyp rxy_pairs data frame.  An element of the rxy_pairs list column
+#' @param spaw spawners data frame.  An element of the spawners list column
+#' @param nperm number of permutations to consider
+extract_permuted_rxy <- function(tdf, rxyp, spaw, nperm = 100) {
+  
+  # vectors of males and females observed in trios
+  obs_males <- unique(tdf$pa)
+  obs_females <- unique(tdf$ma)
+  
+  # vectors of the males and females that were actually spawned on that day
+  smales <- spaw %>%
+    filter(sex == "Male") %>%
+    pull(indiv)
+  
+  sfemales <- spaw %>%
+    filter(sex == "Female") %>%
+    pull(indiv)
+  
+  # tibbles of permuted males (females) assigned to observed males (females)
+  pmales <- tibble(
+    perm = rep(1:nperm, each = length(obs_males)),
+    pa = rep(obs_males, times = nperm),
+    ind1 = unlist(lapply(1:nperm, function(i) sample(x = smales, size = length(obs_males), replace = FALSE)))
+  )
+  
+  pfemales <- tibble(
+    perm = rep(1:nperm, each = length(obs_females)),
+    ma = rep(obs_females, times = nperm),
+    ind2 = unlist(lapply(1:nperm, function(i) sample(x = sfemales, size = length(obs_females), replace = FALSE)))
+  )
+  
+  # now we join that with the trios and then extract the pairwise rxy values for those.
+  # we will toss all the columns that have the Pa_ID and Ma_ID there for each permutation,
+  # but those might be useful later.  This is where we should come back to get it if we need it
+  # later. In fact, I do that (by commenting a few lines out) here so that I will be able to assess things later.
+  tdf %>% 
+    left_join(pmales, by = "pa") %>%
+    left_join(pfemales, by = c("perm", "ma")) %>%
+    arrange(perm, pa, ma) %>%
+    left_join(rxyp, by = c("ind1", "ind2")) # %>%
+    # select(perm, quellergt)
+}
+```
+
+
+So, now we just need to use those...
+```{r}
+#CH
+set.seed(100)  # for reproducibility
+permy_results_CH <- interm1_CH %>%
+  mutate(obs_rxy = map2(.x = trios, .y = rxy_pairs, .f = extract_observed_rxy),
+         perm_rxy = pmap(.l = list(trios, rxy_pairs, spawners), .f = extract_permuted_rxy, nperm = 100)
+         )
+#FRH
+set.seed(100)  # for reproducibility
+permy_results_FRH <- interm1_FRH %>%
+  mutate(obs_rxy = map2(.x = trios, .y = rxy_pairs, .f = extract_observed_rxy),
+         perm_rxy = pmap(.l = list(trios, rxy_pairs, spawners), .f = extract_permuted_rxy, nperm = 100)
+         )
+
+#MRH
+set.seed(100)  # for reproducibility
+permy_results_MRH <- interm1_MRH %>%
+  mutate(obs_rxy = map2(.x = trios, .y = rxy_pairs, .f = extract_observed_rxy),
+         perm_rxy = pmap(.l = list(trios, rxy_pairs, spawners), .f = extract_permuted_rxy, nperm = 100)
+         )
+
+#NH
+set.seed(100)  # for reproducibility
+permy_results_NH <- interm1_NH %>%
+  mutate(obs_rxy = map2(.x = trios, .y = rxy_pairs, .f = extract_observed_rxy),
+         perm_rxy = pmap(.l = list(trios, rxy_pairs, spawners), .f = extract_permuted_rxy, nperm = 100)
+         )
+```
+
+
+## Look at Results
+
+Quick look at means:
+```{r}
+##CH
+obs_means_CH <- permy_results_CH %>%
+  mutate(obs_mean = map_dbl(obs_rxy, function(x) mean(x$quellergt))) %>%
+  select(spawn_date, obs_mean)
+perm_means_CH <- permy_results_CH %>%
+  mutate(perm_means = map(perm_rxy, function(x) x %>% group_by(perm) %>% summarise(perm_mean = mean(quellergt)))) %>%
+  select(spawn_date, perm_means) %>%
+  unnest(perm_means)
+# now, we can join those on spawn date:
+the_means_CH <- obs_means_CH %>%
+  left_join(perm_means_CH, by = "spawn_date") %>%
+  group_by(spawn_date) %>%
+  mutate(perm_means_mean = mean(perm_mean))
+
+##FRH
+obs_means_FRH <- permy_results_FRH %>%
+  mutate(obs_mean = map_dbl(obs_rxy, function(x) mean(x$quellergt))) %>%
+  select(spawn_date, obs_mean)
+perm_means_FRH <- permy_results_FRH %>%
+  mutate(perm_means = map(perm_rxy, function(x) x %>% group_by(perm) %>% summarise(perm_mean = mean(quellergt)))) %>%
+  select(spawn_date, perm_means) %>%
+  unnest(perm_means)
+# now, we can join those on spawn date:
+the_means_FRH <- obs_means_FRH %>%
+  left_join(perm_means_FRH, by = "spawn_date") %>%
+  group_by(spawn_date) %>%
+  mutate(perm_means_mean = mean(perm_mean))
+
+##MRH
+obs_means_MRH <- permy_results_MRH %>%
+  mutate(obs_mean = map_dbl(obs_rxy, function(x) mean(x$quellergt))) %>%
+  select(spawn_date, obs_mean)
+perm_means_MRH <- permy_results_MRH %>%
+  mutate(perm_means = map(perm_rxy, function(x) x %>% group_by(perm) %>% summarise(perm_mean = mean(quellergt)))) %>%
+  select(spawn_date, perm_means) %>%
+  unnest(perm_means)
+# now, we can join those on spawn date:
+the_means_MRH <- obs_means_MRH %>%
+  left_join(perm_means_MRH, by = "spawn_date") %>%
+  group_by(spawn_date) %>%
+  mutate(perm_means_mean = mean(perm_mean))
+
+##NH
+obs_means_NH <- permy_results_NH %>%
+  mutate(obs_mean = map_dbl(obs_rxy, function(x) mean(x$quellergt))) %>%
+  select(spawn_date, obs_mean)
+perm_means_NH <- permy_results_NH %>%
+  mutate(perm_means = map(perm_rxy, function(x) x %>% group_by(perm) %>% summarise(perm_mean = mean(quellergt)))) %>%
+  select(spawn_date, perm_means) %>%
+  unnest(perm_means)
+# now, we can join those on spawn date:
+the_means_NH <- obs_means_NH %>%
+  left_join(perm_means_NH, by = "spawn_date") %>%
+  group_by(spawn_date) %>%
+  mutate(perm_means_mean = mean(perm_mean))
+```
+
+
+Now, we can plot those means:
+```{r}
+#CH
+ggplot(the_means_CH, aes(x = perm_means_mean, y = obs_mean)) + 
+  geom_point(colour = "blue") +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+```{r}
+#FRH
+ggplot(the_means_FRH, aes(x = perm_means_mean, y = obs_mean)) + 
+  geom_point(colour = "blue") +
+  geom_abline(intercept = 0, slope = 1)+
+  scale_x_continuous(name = "perm_means_mean", limits = c(-0.5,0.5))+
+  scale_y_continuous(name = "obs_mean", limits = c(-0.5,0.5))
+```
+
+```{r}
+#MRH
+ggplot(the_means_MRH, aes(x = perm_means_mean, y = obs_mean)) + 
+  geom_point(colour = "blue") +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+```{r}
+#NH
+ggplot(the_means_NH, aes(x = perm_means_mean, y = obs_mean)) + 
+  geom_point(colour = "blue") +
+  geom_abline(intercept = 0, slope = 1)
+```
+
+
+
+```{r}
+#CH
+obs_dsn_CH <- permy_results_CH %>%
+  select(spawn_date, obs_rxy) %>%
+  unnest(obs_rxy) %>%
+  select(spawn_date, quellergt)
+permy_dsn_CH <-  permy_results_CH %>%
+  select(spawn_date, perm_rxy) %>%
+  unnest(perm_rxy)
+the_dsns_CH <- bind_rows(list(observed = obs_dsn_CH, permuted = permy_dsn_CH),
+                      .id = "type")
+  
+ggplot(the_dsns_CH, aes(x = quellergt, fill = type)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = position_identity(),
+                 alpha = 0.3)+
+  ggtitle("CH")
+```
+
+
+```{r}
+#FRH
+obs_dsn_FRH <- permy_results_FRH %>%
+  select(spawn_date, obs_rxy) %>%
+  unnest(obs_rxy) %>%
+  select(spawn_date, quellergt)
+permy_dsn_FRH <-  permy_results_FRH %>%
+  select(spawn_date, perm_rxy) %>%
+  unnest(perm_rxy)
+the_dsns_FRH <- bind_rows(list(observed = obs_dsn_FRH, permuted = permy_dsn_FRH),
+                      .id = "type")
+  
+ggplot(the_dsns_FRH, aes(x = quellergt, fill = type)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = position_identity(),
+                 alpha = 0.3)+
+  ggtitle("FRH")
+```
+
+
+
+```{r}
+#MRH
+obs_dsn_MRH <- permy_results_MRH %>%
+  select(spawn_date, obs_rxy) %>%
+  unnest(obs_rxy) %>%
+  select(spawn_date, quellergt)
+permy_dsn_MRH <-  permy_results_MRH %>%
+  select(spawn_date, perm_rxy) %>%
+  unnest(perm_rxy)
+the_dsns_MRH <- bind_rows(list(observed = obs_dsn_MRH, permuted = permy_dsn_MRH),
+                      .id = "type")
+  
+ggplot(the_dsns_MRH, aes(x = quellergt, fill = type)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = position_identity(),
+                 alpha = 0.3)+
+  ggtitle("MRH")
+```
+
+
+```{r}
+#NH
+obs_dsn_NH <- permy_results_NH %>%
+  select(spawn_date, obs_rxy) %>%
+  unnest(obs_rxy) %>%
+  select(spawn_date, quellergt)
+permy_dsn_NH <-  permy_results_NH %>%
+  select(spawn_date, perm_rxy) %>%
+  unnest(perm_rxy)
+the_dsns_NH <- bind_rows(list(observed = obs_dsn_NH, permuted = permy_dsn_NH),
+                      .id = "type")
+  
+ggplot(the_dsns_NH, aes(x = quellergt, fill = type)) + 
+  geom_histogram(aes(y = ..density..),
+                 position = position_identity(),
+                 alpha = 0.3)+
+  ggtitle("NH")
+```
+
+
